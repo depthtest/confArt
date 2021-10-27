@@ -1,0 +1,11 @@
+.vscode/*
+.DS_Store
+Thumbs.db
+
+*.py[cod]
+
+*.svg
+*.wcnf
+*.log
+*.xes
+*.pnml
