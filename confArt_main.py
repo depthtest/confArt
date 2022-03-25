@@ -14,6 +14,14 @@ ART_FUNCS = {
     CA.ANTI_ALIGNMENT : CA.anti_alignment,
 }
 
+CST_FUNCS = {
+    CA.STD_COST : CA.cost_standard,
+    CA.MSY_COST : CA.cost_max_synchro,
+    CA.LIN_COST : CA.cost_decay_lin,
+    CA.EXP_COST : CA.cost_decay_exp,
+    CA.FIB_COST : CA.cost_decay_fib,
+}
+
 def main_encode(args, other_args):
     encoder_argp = argparse.ArgumentParser()
     encoder_argp.add_argument('--disable_amo', action='store_true')
@@ -26,26 +34,31 @@ def main_encode(args, other_args):
     ca.distanceMetric = args.distance
     ca.fullRun = args.reach_final
     ca.runsize = args.run_size + args.max_d
+    ca.prefix = args.prefix
     ca.numTraces = args.num_traces
+    ca.costFunction = CST_FUNCS[args.cost_function]
 
     wcnf = ART_FUNCS[args.artefact](ca, model, m0, mf, traces, **vars(parser_other))
     params = {
         'artefact' : args.artefact,
-        'model' : str(args.model.absolute()),
+        'model_path' : str(args.model.absolute()),
         'log_trace' : str(args.log_trace.absolute()),
         'distance' : args.distance,
         'reach_final' : args.reach_final,
         'run_size' : args.run_size,
         'max_d' : args.max_d,
+        'prefix' : args.prefix,
         'num_traces' : args.num_traces,
+        'cost_func' : args.cost_function,
     }
     params.update(vars(parser_other))
-    wcnf.add_comment('Partial MaxSAT Conformance Checking Artefacts')
+    wcnf.add_comment('MaxSAT Conformance Checking Artefacts')
     wcnf.add_comment(f'PARAMS:{json.dumps(params)}')
     wcnf.write_dimacs_file(args.out_wcnf)
 
 def main_check(args, other_args):
     checker_argp = argparse.ArgumentParser()
+    checker_argp.add_argument('--outfile', type=pathlib.Path) ## ONLY FOR ALIGNMENT
     checker_argp.add_argument('--verbose', action='store_true')
     parser_other = checker_argp.parse_args(other_args)
 
@@ -53,37 +66,38 @@ def main_check(args, other_args):
         solution = []
         with open(maxsat_file) as mf:
             for line in mf:
-                matched = re.match(r'^v (.*)', line)
-                if matched is None:
-                    continue
-                else:
+                if matched := re.match(r'^v (.*)', line):
                     solution = list(map(lambda x: int(x), matched[1].split(' ')))
-        return solution
+                elif matched := re.match(r'^o ([0-9]+)', line):
+                    cost = int(matched[1])
+                else: continue
+        return solution, cost
 
     ## Search PARAMS comment in formula
     with open(args.maxsat_formula) as f:
         for line in f:
-            matched = re.match(r'^c PARAMS:(.*)$', line)
-            if matched is not None:
+            if matched :=  re.match(r'^c PARAMS:(.*)$', line):
                 params = json.loads(matched.group(1))
                 break
 
-    model, m0, mf = read_pnml(params.pop('model'))
-    traces = read_xes(params.pop('log_trace'))
+    model, m0, mf = read_pnml(params['model_path'])
+    traces = read_xes(params['log_trace'])
 
     ca = CA()
-    ca.distanceMetric = params.pop('distance')
-    ca.fullRun = params.pop('reach_final')
-    ca.runsize = params.pop('run_size') + params.pop('max_d')
-    ca.numTraces = params.pop('num_traces')
+    ca.distanceMetric = params['distance']
+    ca.fullRun = params['reach_final']
+    args_run_size = params['run_size']
+    args_max_d = params['max_d']
+    ca.runsize = args_run_size + args_max_d
+    ca.prefix = params['prefix']
+    ca.numTraces = params['num_traces']
+    ca.costFunction = CST_FUNCS[params['cost_func']]
 
-    artefact = params.pop('artefact')
+    artefact = params['artefact']
 
     _ = ART_FUNCS[artefact](ca, model, m0, mf, traces, **params)
-
-    solution = parse_maxsat_solution(args.maxsat_output)
-    ca.check(solution, parser_other.verbose)
-
+    solution, cost = parse_maxsat_solution(args.maxsat_output)
+    ca.output_alignment_result(params, solution, cost, **vars(parser_other))
 
 if __name__ == '__main__':
     argp = argparse.ArgumentParser()
@@ -98,8 +112,10 @@ if __name__ == '__main__':
     encode_argp.add_argument('--num_traces', type=int, required=True, help='Number of traces from log to encode')
     encode_argp.add_argument('--run_size', type=int, required=True, help='Size of the run (n) to encode')
     encode_argp.add_argument('--max_d', type=int, required=True, help='Max edit distance allowed to encode')
+    encode_argp.add_argument('--prefix', type=int, default=0, help='Max length of trace to encode')
     encode_argp.add_argument('--reach_final', action='store_true', help='Encode full model -- force final marking | def: %(default)r')
     encode_argp.add_argument('--distance', choices=DST_CHOICES, default=DST_CHOICES[0])
+    encode_argp.add_argument('--cost_function', choices=CST_FUNCS.keys(), default=CA.STD_COST)
     encode_argp.set_defaults(func=main_encode)
 
     ## CHECKER

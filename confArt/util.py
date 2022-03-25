@@ -1,4 +1,74 @@
 from abc import ABC, abstractmethod
+import importlib.util
+
+#########################################################################################
+
+class __ProxyClassType(type):
+    _impl = None
+    def __getattr__(cls, key):
+        def wrapped_method(*args, **kwargs):
+            return getattr(cls._impl, key)(*args, **kwargs)
+        return wrapped_method
+
+class __ProxyClass(metaclass=__ProxyClassType):
+    def __init__(self):
+        self.inst = self._impl()
+    def __getattr__(self, name):
+        def wrapped_method(*args, **kwargs):
+            return getattr(self.inst, name)(*args, **kwargs)
+        return wrapped_method
+
+class proxyWCNF(__ProxyClass):
+    pass
+class proxyEncoder(__ProxyClass):
+    pass
+
+if importlib.util.find_spec('optilog') is None:
+    # if there is no OptiLOG, use PySAT as fallback
+    from pysat.formula import WCNF
+    from pysat.card import CardEnc
+
+    # As the original code was done for OptiLOG, we create an adapter
+    # so the proxies can make the same calls to PySAT as to OptiLOG
+    # and the client code (confArt.py) is unaffected
+
+    class pysatWCNF:
+        def __init__(self):
+            self.formula = WCNF()
+        def extend_vars(self, num):
+            self.formula.nv += num
+        def add_clause(self, clause, weight=None):
+            self.formula.append(clause, weight)
+        def add_clauses(self, clauses):
+            self.formula.extend(clauses)
+        def max_var(self):
+            return self.formula.nv
+        def add_comment(self, comment):
+            self.formula.comments.append('c ' + comment)
+        def write_dimacs_file(self, filename):
+            self.formula.to_file(filename)
+
+    class pysatEncoder:
+        @staticmethod
+        def exactly_one(literals, max_var=None):
+            this_cardenc = CardEnc.equals(literals, bound=1, top_id=max_var)
+            return this_cardenc.nv, this_cardenc.clauses
+        @staticmethod
+        def at_most_one(literals, max_var=None):
+            this_cardenc = CardEnc.atmost(literals, bound=1, top_id=max_var)
+            return this_cardenc.nv, this_cardenc.clauses
+
+    proxyWCNF._impl = pysatWCNF
+    proxyEncoder._impl = pysatEncoder
+
+else:
+    from optilog.formulas import WCNF
+    from optilog.sat.pbencoder import Encoder
+
+    proxyWCNF._impl = WCNF
+    proxyEncoder._impl = Encoder
+
+#########################################################################################
 
 class VariableMgr:
     ###################################################################
@@ -82,6 +152,7 @@ class VariableMgr:
                 return (varL, varM.inv(intVar))
         return None
 
+#########################################################################################
 
 class FormulaMgr:
     def __init__(self, maxvar = 0):

@@ -1,9 +1,15 @@
+from functools import cache
 from pm4py.objects.petri_net.obj import PetriNet, Marking
 from pm4py.objects.log.util.log import project_traces
-from optilog.formulas import WCNF
-from optilog.sat.pbencoder import Encoder
+from pm4py.objects.petri_net.utils import petri_utils
 
-from confArt.util import VariableMgr, FormulaMgr
+from confArt.util import VariableMgr, FormulaMgr, proxyWCNF as WCNF, proxyEncoder as Encoder
+
+@cache
+def fib(n) -> int:
+    if n < 3: # n==1 or n==2
+        return 1
+    return fib(n-1) + fib(n-2)
 
 class confArtefact:
     EDIT_DISTANCE = 'edit'
@@ -14,14 +20,23 @@ class confArtefact:
     ANTI_ALIGNMENT = 'anti'
     __ALIGNMENTS = [EXAC_ALIGNMENT, MULT_ALIGNMENT, ANTI_ALIGNMENT,]
 
-    def __init__(self, filler_transition='OMEGA'):
+    STD_COST = 'standard'
+    MSY_COST = 'max_synchro'
+    LIN_COST = 'decay_lin'
+    EXP_COST = 'decay_exp'
+    FIB_COST = 'decay_fib'
+    __COSTS = [STD_COST, MSY_COST, LIN_COST, EXP_COST, FIB_COST,]
+
+    def __init__(self, filler_transition='OMEGA', final_place='CONF_ART_FINAL'):
         self._distance = confArtefact.EDIT_DISTANCE
         self._isfullRun = False
         self._runsize = 0
-        self._max_d = 0
+        self._prefix = 0
         self._num_traces = 0
         self._optim_sum = False
         self._filler_label = filler_transition
+        self._finalplace_name = final_place
+        self._costfunction = confArtefact.cost_standard
 
     # region Properties
 
@@ -48,94 +63,138 @@ class confArtefact:
         self._runsize = int(value)
 
     @property
+    def prefix(self):
+        return self._prefix
+    @prefix.setter
+    def prefix(self, value):
+        self._prefix = int(value)
+
+    @property
     def numTraces(self):
         return self._num_traces
     @numTraces.setter
     def numTraces(self, value):
         self._num_traces = int(value)
 
+    @property
+    def costFunction(self):
+        return self._costfunction
+    @costFunction.setter
+    def costFunction(self, value):
+        self._costfunction = value
+
     # endregion
 
     ##########################################################################################
 
-    def check(self, solution, verbose=False):
+    def output_alignment_result(self, params, solution, cost, outfile=None, **kwargs):
+        run, traces, traces_dist = self.check(solution, **kwargs)
+        if outfile:
+            modelname = params['model_path']
+            logname = params['log_trace']
+            ntrace = params['num_traces']
+            func = params['cost_func']
+
+            # REMOVE ENDING OMEGAS
+            first_filler = run.find(self._filler_label)
+            run = run[:(first_filler+len(self._filler_label))]
+
+            run = '[' + run + ']'
+            trace = '[' + traces[0] + ']'
+            with open(outfile, 'w') as ff:
+                print(f'c M {modelname}', file=ff, end='\n')  # c L modelname
+                print(f'c L {logname}', file=ff, end='\n')    # c L logname
+                print(f'c NT {ntrace}', file=ff, end='\n')    # c NT val
+                print(f'c F {func}', file=ff, end='\n')       # c F func
+                print(f'c C {cost}', file=ff, end='\n')       # c C val
+                print(f'c T {trace}', file=ff, end='\n')      # c T [sym,sym,sym]
+                print(f'o {run}', file=ff, end='\n')          # o [sym,sym,sym]
+
+    def check(self, solution, verbose=False, **kwargs):
         def getActVars(solution, varname):
             varrange = self.VM.getVarRange(varname)
             return list(filter(lambda x: x>0, solution[varrange[0]-1:varrange[1]]))
         def getActualVals(vars):
             return list(map(lambda x: self.VM.inv(x)[1], vars))
 
-        print('PLACES', self.lst_places)
-        print('TRANSITIONS', self.lst_transitions)
-        print('*'*50)
+        lst_transitions = self.lst_named_transitions + self.lst_silent_transitions
         # MODEL RUN FOUND
         model_vars = getActualVals(getActVars(solution, 'nu_it'))
-        print('RUN:', ','.join(map(lambda x: str(self.lst_transitions[x[1]]), model_vars)))
-        # PRINT MARKING (if verbose)
-        if verbose:
-            marking_vars = getActualVals(getActVars(solution, 'm_ip'))
-            print('MARKINGS:',
-                list(map(
-                    lambda z:
-                        list(map(
-                                lambda x: str(self.lst_places[x[1]]),
-                                filter(
-                                    lambda y: y[0]==z,
-                                    marking_vars
-                                )
-                        )),
-                    range(self.runsize+1)
-                ))
-            )
+        run = ','.join(map(lambda x: lst_transitions[x[1]].label if lst_transitions[x[1]].label else '>>', model_vars))
 
-        # FOR EACH LOG
-        maxdst = -1
-        mindst = 100000000
-        avgdst = 0.0
+        # FOR EACH TRACE
+        traces = []
+        trace_dists = []
         for i in range(self.numEncTraces):
-            print('-'*50)
-            lid = f'_{i}' if (self.numEncTraces > 1 or self.encoding != confArtefact.EXAC_ALIGNMENT) else ''
-            # PRINT LOG
+            lid = f'_{i}' if (self.encoding != confArtefact.EXAC_ALIGNMENT) else ''
             log_vars = getActualVals(getActVars(solution, f'lambda_ja{lid}'))
-            print(f'LOG{lid}:', ','.join(map(lambda x: str(self.lst_transitions[x[1]]), log_vars)))
+            traces.append(','.join(map(lambda x: self.lst_named_transitions[x[1]].label, log_vars)))
             alpha_vars = getActualVals(getActVars(solution, f'alpha_i{lid}'))
             beta_vars = getActualVals(getActVars(solution, f'beta_j{lid}'))
-            this_dst = len(alpha_vars) + len(beta_vars)
-            print(f'EDIT DST:', this_dst)
-            maxdst = this_dst if this_dst > maxdst else maxdst
-            mindst = this_dst if this_dst < mindst else mindst
-            avgdst = (i*avgdst + this_dst) / (i+1)
-            if verbose:
-                # PRINT ALPHAs and BETAS
-                print(f'ALPHA{lid}:', ','.join(map(lambda x: str(x[0]), alpha_vars)))
-                print(f'BETA{lid}:', ','.join(map(lambda x: str(x[0]), beta_vars)))
-                # PRINT TAUS (if verbose)
-                tau_vars = getActualVals(getActVars(solution, f'tau_ji{lid}'))
-                print(f'TAU{lid}', tau_vars)
-        print('*'*50)
-        print('MAX EDIT DST', maxdst)
-        print('MIN EDIT DST', mindst)
-        print('AVG EDIT DST', avgdst)
+            ## This will only be correct for (multi-)alignments
+            ## Anti-alignments would require a proper edit distance computation between run and trace
+            trace_dists.append(len(alpha_vars) + len(beta_vars))
+
+        if verbose:
+            print('PLACES', self.lst_places)
+            print('TRANSITIONS', list(map(lambda x: x.label if x.label else f'TAU|{x.name}', lst_transitions)))
+            print('*'*50)
+            print('RUN:', run)
+            marking_vars = getActualVals(getActVars(solution, 'm_ip'))
+            print('MARKINGS:',
+                list(map(lambda z:
+                            list(map(lambda x: str(self.lst_places[x[1]]),
+                                    filter(lambda y: y[0]==z, marking_vars))),
+                        range(self.runsize+1)
+                    ))
+            )
+            maxdst = -1
+            mindst = 100000000
+            avgdst = 0.0
+            for i in range(self.numEncTraces):
+                print('-'*50)
+                print(f'LOG_{i}:', traces[i])
+                print(f'EDIT DST:', trace_dists[i])
+                maxdst = trace_dists[i] if trace_dists[i] > maxdst else maxdst
+                mindst = trace_dists[i] if trace_dists[i] < mindst else mindst
+                avgdst = (i*avgdst + trace_dists[i]) / (i+1)
+            print('*'*50)
+            print('MAX EDIT DST', maxdst)
+            print('MIN EDIT DST', mindst)
+            print('AVG EDIT DST', avgdst)
+
+        return run, traces, trace_dists
 
     ##########################################################################################
+
+    def __add_finalmarking_from_any_place(self, model, **kwargs):
+        self._finalplace = PetriNet.Place(f'{self._finalplace_name}_P')
+        for transition in model.transitions:
+            petri_utils.add_arc_from_to(transition, self._finalplace, model)
+        model.places.add(self._finalplace)
 
     def __addfillertransition(self, model, mf, **kwargs):
         ## add filler transition to model
         self._filler_transition = PetriNet.Transition(self._filler_label, label=self._filler_label)
         for place, _ in mf.items():
-            arcIn = PetriNet.Arc(place, self._filler_transition)
-            arcOut = PetriNet.Arc(self._filler_transition, place)
-            self._filler_transition.in_arcs.add(arcIn)
-            self._filler_transition.out_arcs.add(arcOut)
-            place.out_arcs.add(arcIn)
-            place.in_arcs.add(arcOut)
-            model.arcs.add(arcIn)
-            model.arcs.add(arcOut)
+            petri_utils.add_arc_from_to(place, self._filler_transition, model)
+            petri_utils.add_arc_from_to(self._filler_transition, place, model)
         model.transitions.add(self._filler_transition)
 
     def __encodePetriNet(self, model:PetriNet, m0:Marking, mf:Marking, **kwargs):
         lst_places = sorted(list(model.places), key=lambda x:str(x))
-        lst_transitions = sorted(list(model.transitions), key=lambda x:str(x))
+
+        lst_named_transitions = sorted(
+            list(filter(lambda y: y.label is not None, model.transitions)),
+            key=lambda x:str(x)
+        )
+
+        lst_silent_transitions = sorted(
+            list(filter(lambda y: y.label is None, model.transitions)),
+            key=lambda x:str(x)
+        )
+
+        lst_transitions = lst_named_transitions + lst_silent_transitions
 
         self._filler_index = lst_transitions.index(self._filler_transition)
 
@@ -166,12 +225,12 @@ class confArtefact:
             ### EO(t)
             _, clauses = Encoder.exactly_one([self.VM('nu_it', i, tid) for tid, _ in enumerate(lst_transitions)], max_var=current_max_var)
             self.formula.add_clauses(clauses)
-            
+
             for tid, t in enumerate(lst_transitions):
                 tV = self.VM('nu_it', i, tid)
                 t_preset = set(map(lambda x: x.source, t.in_arcs))
                 t_postset = set(map(lambda x: x.target, t.out_arcs))
-                
+
                 for pid, p in enumerate(lst_places):
                     if p in t_preset:
                         ### nu_it -> m_im1p
@@ -200,23 +259,23 @@ class confArtefact:
                             -self.VM('nu_it', i, tid), self.VM('nu_it', i+1, tid)
                         ])
 
-        return lst_places, lst_transitions
+        return lst_places, lst_named_transitions, lst_silent_transitions
 
-    def __encodeLogTrace(self, lst_transitions, trace, traceIdx='', **kwargs):
+    def __encodeLogTrace(self, lst_named_transitions, trace, traceIdx='', **kwargs):
         ## modify log (add filler character)
         trace.append(self._filler_label)
-        ## create lambda_ja vars 
-        last_var_used = self.VM.addVar(f'lambda_ja{traceIdx}', [(1, len(trace)), (0, len(lst_transitions))], self.formula.max_var())
+        ## create lambda_ja vars
+        last_var_used = self.VM.addVar(f'lambda_ja{traceIdx}', [(1, len(trace)), (0, len(lst_named_transitions))], self.formula.max_var())
         self.formula.extend_vars(last_var_used - self.formula.max_var())
-        ## activate only the lambda_ja such that "a" corresponds to the character in pos "j" 
+        ## activate only the lambda_ja such that "a" corresponds to the character in pos "j"
         for j in range(len(trace)):
-            for tid, t in enumerate(lst_transitions):
-                if trace[j] == str(t): ## str(t) returns transition label (if it has, else uses name)
+            for tid, t in enumerate(lst_named_transitions):
+                if trace[j] == t.label: ## str(t) returns transition label (if it has, else uses name)
                     self.formula.add_clause([self.VM(f'lambda_ja{traceIdx}', j+1, tid)])
                 else:
                     self.formula.add_clause([-self.VM(f'lambda_ja{traceIdx}', j+1, tid)])
 
-    def __encodeMatching(self, lst_transitions, trace_len, tID='', **kwargs):
+    def __encodeMatching(self, lst_named_transitions, lst_silent_transitions, trace_len, tID='', **kwargs):
         ## create tau_ji vars
         self.VM.addVar(f'tau_ji{tID}', [(1, trace_len), (1, self.runsize)])
         ## create alpha_i vars
@@ -229,7 +288,7 @@ class confArtefact:
         # region Route through tau matrix
         ## tau_1,1 and tau_L,N
         self.formula.add_clauses([
-            [self.VM(f'tau_ji{tID}', 1, 1)], 
+            [self.VM(f'tau_ji{tID}', 1, 1)],
             [self.VM(f'tau_ji{tID}', trace_len, self.runsize)]
         ])
 
@@ -290,14 +349,19 @@ class confArtefact:
         nu_eq_lambda = {}
         for i in range(1, self.runsize+1):
             or_tau_eq_lst = []
+            ### nu_it is silent
+            for st_id, _ in enumerate(lst_silent_transitions):
+                or_tau_eq_lst.append(
+                    f.LIT(self.VM('nu_it', i, len(lst_named_transitions)+st_id))
+                )
 
             for j in range(1, trace_len+1):
                 Ni_eq_Lj_lst = []
                 #### OR_t nu_it and lambda_jt
-                for tid, _ in enumerate(lst_transitions):
-                    Ni_eq_Lj_lst.append( 
+                for tid, _ in enumerate(lst_named_transitions):
+                    Ni_eq_Lj_lst.append(
                         f.AND([
-                            f.LIT(self.VM('nu_it', i, tid)), 
+                            f.LIT(self.VM('nu_it', i, tid)),
                             f.LIT(self.VM(f'lambda_ja{tID}', j, tid))
                         ])
                     )
@@ -308,7 +372,7 @@ class confArtefact:
                 if i < self.runsize:
                     next_j = j if j == trace_len else (j + 1)
                     self.formula.add_clause([
-                        -self.VM(f'tau_ji{tID}', j, i), 
+                        -self.VM(f'tau_ji{tID}', j, i),
                         -nu_eq_lambda[(j, i)],
                         self.VM(f'tau_ji{tID}', next_j, i+1)
                     ])
@@ -361,31 +425,49 @@ class confArtefact:
 
         # endregion
 
-    def __encodeFullLog(self, lst_transitions, projected_traces, **kwargs):
+    def __encodeFullLog(self, lst_named_transitions, lst_silent_transitions, projected_traces, **kwargs):
         self.numTraces = min(len(projected_traces), self.numTraces)
         for traceid, trace in enumerate(projected_traces[:self.numTraces]):
-            self.__encodeLogTrace(lst_transitions, trace, traceIdx=f'_{traceid}', **kwargs)
-            self.__encodeMatching(lst_transitions, len(trace), tID=f'_{traceid}', **kwargs)
+            if self.prefix != 0:
+                retrace = trace[:self.prefix]
+            else:
+                retrace = trace
+            self.__encodeLogTrace(lst_named_transitions, retrace, traceIdx=f'_{traceid}', **kwargs)
+            self.__encodeMatching(lst_named_transitions, lst_silent_transitions, len(retrace), tID=f'_{traceid}', **kwargs)
 
     def alignment(self, model, m0, mf, traces, **kwargs):
         assert(self.numTraces <= len(traces))
 
         self.formula = WCNF()
         self.VM = VariableMgr()
+
+        if not self.fullRun:
+            ## if unfinished log, add final place reachable from any transition in the model
+            ## changing the final marking, then addfiller will create a loop on that final place
+            self.__add_finalmarking_from_any_place(model, **kwargs)
+            mf = Marking()
+            mf[self._finalplace] = 1
+
         ## modify model (add filler transition)
         self.__addfillertransition(model, mf, **kwargs)
         ## encode petrinet
-        self.lst_places, self.lst_transitions = self.__encodePetriNet(model, m0, mf, **kwargs)
+        self.lst_places, self.lst_named_transitions, self.lst_silent_transitions = self.__encodePetriNet(model, m0, mf, **kwargs)
         ## encode log
         projected_trace = project_traces(traces)[self.numTraces-1]
-        self.__encodeLogTrace(self.lst_transitions, projected_trace, **kwargs)
+        if self.prefix != 0:
+            retrace = projected_trace[:self.prefix]
+        else:
+            retrace = projected_trace
+        #self.__encodeLogTrace(self.lst_named_transitions, projected_trace, **kwargs)
+        self.__encodeLogTrace(self.lst_named_transitions, retrace, **kwargs)
         ## encode matching
-        self.__encodeMatching(self.lst_transitions, len(projected_trace), **kwargs)
+        #self.__encodeMatching(self.lst_named_transitions, self.lst_silent_transitions, len(projected_trace), **kwargs)
+        self.__encodeMatching(self.lst_named_transitions, self.lst_silent_transitions, len(retrace), **kwargs)
         ##encode soft clauses
-        for i in range(1, self.runsize + 1):
-           self.formula.add_clause([-self.VM('alpha_i', i)], weight=1)
-        for j in range(1, len(projected_trace)+1):
-           self.formula.add_clause([-self.VM('beta_j', j)], weight=1)
+        self.costFunction(self,
+            'alpha_i', self.runsize, -1,
+            'beta_j', len(retrace), -1
+        )
 
         self.numEncTraces = 1
         self.encoding = confArtefact.EXAC_ALIGNMENT
@@ -395,20 +477,28 @@ class confArtefact:
         self.formula = WCNF()
         self.VM = VariableMgr()
 
+        if not self.fullRun:
+            ## if unfinished log, add final place reachable from any transition in the model
+            ## changing the final marking, then addfiller will create a loop on that final place
+            self.__add_finalmarking_from_any_place(model, **kwargs)
+            mf = Marking()
+            mf[self._finalplace] = 1
+
         ## modify model (add filler transition)
         self.__addfillertransition(model, mf, **kwargs)
         ## encode petrinet
-        self.lst_places, self.lst_transitions = self.__encodePetriNet(model, m0, mf, **kwargs)
+        self.lst_places, self.lst_named_transitions, self.lst_silent_transitions = self.__encodePetriNet(model, m0, mf, **kwargs)
 
         ## encode full log and matching
         projected_traces = project_traces(traces)
-        self.__encodeFullLog(self.lst_transitions, projected_traces, **kwargs)
+        self.__encodeFullLog(self.lst_named_transitions, self.lst_silent_transitions, projected_traces, **kwargs)
         #encode soft clauses
         for traceID in range(self.numTraces):
-            for i in range(1, self.runsize + 1):
-                self.formula.add_clause([-self.VM(f'alpha_i_{traceID}', i)], weight=1)
-            for j in range(1, len(projected_traces[traceID])+1):
-                self.formula.add_clause([-self.VM(f'beta_j_{traceID}', j)], weight=1)
+            lenTrace = min(self.prefix, len(projected_traces[traceID])) if self.prefix != 0 else len(projected_traces[traceID])
+            self.costFunction(self,
+                f'alpha_i_{traceID}', self.runsize, -1,
+                f'beta_j_{traceID}', lenTrace, -1
+            )
 
         self.numEncTraces = self.numTraces
         self.encoding = confArtefact.MULT_ALIGNMENT
@@ -418,20 +508,68 @@ class confArtefact:
         self.formula = WCNF()
         self.VM = VariableMgr()
 
+        if not self.fullRun:
+            ## if unfinished log, add final place reachable from any transition in the model
+            ## changing the final marking, then addfiller will create a loop on that final place
+            self.__add_finalmarking_from_any_place(model, **kwargs)
+            mf = Marking()
+            mf[self._finalplace] = 1
+
         ## modify model (add filler transition)
         self.__addfillertransition(model, mf, **kwargs)
         ## encode petrinet
-        self.lst_places, self.lst_transitions = self.__encodePetriNet(model, m0, mf, **kwargs)
+        self.lst_places, self.lst_named_transitions, self.lst_silent_transitions = self.__encodePetriNet(model, m0, mf, **kwargs)
         ## encode full log and matching
         projected_traces = project_traces(traces)
-        self.__encodeFullLog(self.lst_transitions, projected_traces, **kwargs)
+        self.__encodeFullLog(self.lst_named_transitions, self.lst_silent_transitions, projected_traces, **kwargs)
         #encode soft clauses
         for traceID in range(self.numTraces):
-            for i in range(1, self.runsize + 1):
-                self.formula.add_clause([self.VM(f'alpha_i_{traceID}', i)], weight=1)
-            for j in range(1, len(projected_traces[traceID])+1):
-                self.formula.add_clause([self.VM(f'beta_j_{traceID}', j)], weight=1)
+            lenTrace = min(self.prefix, len(projected_traces[traceID])) if self.prefix != 0 else len(projected_traces[traceID])
+            self.costFunction(self,
+                f'alpha_i_{traceID}', self.runsize, 1,
+                f'beta_j_{traceID}', lenTrace, 1
+            )
 
         self.numEncTraces = self.numTraces
         self.encoding = confArtefact.ANTI_ALIGNMENT
         return self.formula
+
+    #region COST FUNCTIONS
+
+    def cost_standard(self, ivar_ID, len_i, i_sign, jvar_ID, len_j, j_sign):
+        for i in range(1, len_i + 1):
+            self.formula.add_clause([i_sign * self.VM(ivar_ID, i)], weight=1)
+        for j in range(1, len_j + 1):
+            self.formula.add_clause([j_sign * self.VM(jvar_ID, j)], weight=1)
+
+    def cost_max_synchro(self, ivar_ID, len_i, i_sign, jvar_ID, len_j, j_sign):
+        for i in range(1, len_i + 1):
+            self.formula.add_clause([i_sign * self.VM(ivar_ID, i)], weight=1)
+        for j in range(1, len_j + 1):
+            self.formula.add_clause([j_sign * self.VM(jvar_ID, j)], weight=len_i)
+
+    def cost_decay_lin(self, ivar_ID, len_i, i_sign, jvar_ID, len_j, j_sign):
+        lin_fkM = lambda k, M: M - k + 1
+
+        for i in range(1, len_i + 1):
+            self.formula.add_clause([i_sign * self.VM(ivar_ID, i)], weight=lin_fkM(i, len_i))
+        for j in range(1, len_j + 1):
+            self.formula.add_clause([j_sign * self.VM(jvar_ID, j)], weight=lin_fkM(j, len_j))
+
+    def cost_decay_exp(self, ivar_ID, len_i, i_sign, jvar_ID, len_j, j_sign):
+        exp_fkM = lambda k, M: 2**(M - k)
+
+        for i in range(1, len_i + 1):
+            self.formula.add_clause([i_sign * self.VM(ivar_ID, i)], weight=exp_fkM(i, len_i))
+        for j in range(1, len_j + 1):
+            self.formula.add_clause([j_sign * self.VM(jvar_ID, j)], weight=exp_fkM(j, len_j))
+
+    def cost_decay_fib(self, ivar_ID, len_i, i_sign, jvar_ID, len_j, j_sign):
+        fib_fkm = lambda k, M: fib(M - k + 1)
+
+        for i in range(1, len_i + 1):
+            self.formula.add_clause([i_sign * self.VM(ivar_ID, i)], weight=fib_fkm(i, len_i))
+        for j in range(1, len_j + 1):
+            self.formula.add_clause([j_sign * self.VM(jvar_ID, j)], weight=fib_fkm(j, len_j))
+
+    #endregion
